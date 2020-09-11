@@ -20,9 +20,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// +genclient
-// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
-
+/*
 // Foo is a specification for a Foo resource
 type Foo struct {
 	metav1.TypeMeta   `json:",inline"`
@@ -31,24 +29,52 @@ type Foo struct {
 	Spec   FooSpec   `json:"spec"`
 	Status FooStatus `json:"status"`
 }
+*/
 
+// +genclient
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// Loadbalancer is a specification for a Loadbalancer resource
+type Loadbalancer struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   LoadbalancerSpec   `json:"spec"`
+	Status LoadbalancerStatus `json:"status"`
+}
+
+/*
 // FooSpec is the spec for a Foo resource
 type FooSpec struct {
 	DeploymentName string `json:"deploymentName"`
 	Replicas       *int32 `json:"replicas"`
 }
+*/
 
+// LoadbalancerSpec is the spec for a Loadbalancer resource
+type LoadbalancerSpec struct {
+	LoadbalancerName string `json:"loadbalancerName"`
+}
+
+/*
 // FooStatus is the status for a Foo resource
 type FooStatus struct {
 	AvailableReplicas int32 `json:"availableReplicas"`
 }
+*/
+
+// LoadbalancerStatus is the status for a Loadbalancer resource
+type LoadbalancerStatus struct {
+	LoadbalancerID string `json:"loadbalancerID"`
+	Status         string `json:"status"`
+}
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
-// FooList is a list of Foo resources
-type FooList struct {
+// LoadbalancerList is a list of Loadbalancer resources
+type LoadbalancerList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata"`
 
-	Items []Foo `json:"items"`
+	Items []Loadbalancer `json:"items"`
 }

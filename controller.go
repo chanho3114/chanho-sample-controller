@@ -17,31 +17,34 @@ limitations under the License.
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"os"
 	"time"
 
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
-	appsinformers "k8s.io/client-go/informers/apps/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
-	appslisters "k8s.io/client-go/listers/apps/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
-	samplev1alpha1 "k8s.io/sample-controller/pkg/apis/samplecontroller/v1alpha1"
-	clientset "k8s.io/sample-controller/pkg/generated/clientset/versioned"
-	samplescheme "k8s.io/sample-controller/pkg/generated/clientset/versioned/scheme"
-	informers "k8s.io/sample-controller/pkg/generated/informers/externalversions/samplecontroller/v1alpha1"
-	listers "k8s.io/sample-controller/pkg/generated/listers/samplecontroller/v1alpha1"
+	samplev1alpha1 "github.com/sample-controller/pkg/apis/samplecontroller/v1alpha1"
+	clientset "github.com/sample-controller/pkg/generated/clientset/versioned"
+	samplescheme "github.com/sample-controller/pkg/generated/clientset/versioned/scheme"
+	informers "github.com/sample-controller/pkg/generated/informers/externalversions/samplecontroller/v1alpha1"
+	listers "github.com/sample-controller/pkg/generated/listers/samplecontroller/v1alpha1"
 )
 
 const controllerAgentName = "sample-controller"
@@ -55,24 +58,22 @@ const (
 
 	// MessageResourceExists is the message used for Events when a resource
 	// fails to sync due to a Deployment already existing
-	MessageResourceExists = "Resource %q already exists and is not managed by Foo"
+	//MessageResourceExists = "Resource %q already exists and is not managed by Foo"
+	MessageResourceExists = "Resource %q already exists and is not managed by Loadbalancer"
 	// MessageResourceSynced is the message used for an Event fired when a Foo
 	// is synced successfully
-	MessageResourceSynced = "Foo synced successfully"
+	//MessageResourceSynced = "Foo synced successfully"
+	MessageResourceSynced = "Loadbalancer synced successfully"
 )
 
-// Controller is the controller implementation for Foo resources
+// Controller is the controller implementation for Loadbalancer resources
 type Controller struct {
 	// kubeclientset is a standard kubernetes clientset
 	kubeclientset kubernetes.Interface
 	// sampleclientset is a clientset for our own API group
-	sampleclientset clientset.Interface
-
-	deploymentsLister appslisters.DeploymentLister
-	deploymentsSynced cache.InformerSynced
-	foosLister        listers.FooLister
-	foosSynced        cache.InformerSynced
-
+	sampleclientset     clientset.Interface
+	loadbalancersLister listers.LoadbalancerLister
+	loadbalancersSynced cache.InformerSynced
 	// workqueue is a rate limited work queue. This is used to queue work to be
 	// processed instead of performing it as soon as a change happens. This
 	// means we can ensure we only process a fixed amount of resources at a
@@ -84,13 +85,25 @@ type Controller struct {
 	recorder record.EventRecorder
 }
 
+type mockLB struct {
+	ID     string
+	Name   string
+	Status string
+}
+
 // NewController returns a new sample controller
+/*
 func NewController(
 	kubeclientset kubernetes.Interface,
 	sampleclientset clientset.Interface,
 	deploymentInformer appsinformers.DeploymentInformer,
 	fooInformer informers.FooInformer) *Controller {
-
+*/
+// NewController returns a new sample controller
+func NewController(
+	kubeclientset kubernetes.Interface,
+	sampleclientset clientset.Interface,
+	loadbalancerInformer informers.LoadbalancerInformer) *Controller {
 	// Create event broadcaster
 	// Add sample-controller types to the default Kubernetes Scheme so Events can be
 	// logged for sample-controller types.
@@ -102,44 +115,58 @@ func NewController(
 	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: controllerAgentName})
 
 	controller := &Controller{
-		kubeclientset:     kubeclientset,
-		sampleclientset:   sampleclientset,
-		deploymentsLister: deploymentInformer.Lister(),
-		deploymentsSynced: deploymentInformer.Informer().HasSynced,
-		foosLister:        fooInformer.Lister(),
-		foosSynced:        fooInformer.Informer().HasSynced,
-		workqueue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Foos"),
-		recorder:          recorder,
+		kubeclientset:   kubeclientset,
+		sampleclientset: sampleclientset,
+		//deploymentsLister: deploymentInformer.Lister(),
+		//deploymentsSynced: deploymentInformer.Informer().HasSynced,
+		//foosLister:        fooInformer.Lister(),
+		//foosSynced:        fooInformer.Informer().HasSynced,
+		loadbalancersLister: loadbalancerInformer.Lister(),
+		loadbalancersSynced: loadbalancerInformer.Informer().HasSynced,
+		workqueue:           workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Loadbalancers"),
+		recorder:            recorder,
 	}
 
 	klog.Info("Setting up event handlers")
 	// Set up an event handler for when Foo resources change
-	fooInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: controller.enqueueFoo,
+	/*
+		fooInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc: controller.enqueueFoo,
+			UpdateFunc: func(old, new interface{}) {
+				controller.enqueueFoo(new)
+			},
+		})
+	*/
+	loadbalancerInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: controller.enqueueLoadbalancer,
 		UpdateFunc: func(old, new interface{}) {
-			controller.enqueueFoo(new)
+			controller.enqueueLoadbalancer(new)
 		},
+		DeleteFunc: controller.enqueueLoadbalancer,
 	})
-	// Set up an event handler for when Deployment resources change. This
-	// handler will lookup the owner of the given Deployment, and if it is
-	// owned by a Foo resource will enqueue that Foo resource for
-	// processing. This way, we don't need to implement custom logic for
-	// handling Deployment resources. More info on this pattern:
-	// https://github.com/kubernetes/community/blob/8cafef897a22026d42f5e5bb3f104febe7e29830/contributors/devel/controllers.md
-	deploymentInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: controller.handleObject,
-		UpdateFunc: func(old, new interface{}) {
-			newDepl := new.(*appsv1.Deployment)
-			oldDepl := old.(*appsv1.Deployment)
-			if newDepl.ResourceVersion == oldDepl.ResourceVersion {
-				// Periodic resync will send update events for all known Deployments.
-				// Two different versions of the same Deployment will always have different RVs.
-				return
-			}
-			controller.handleObject(new)
-		},
-		DeleteFunc: controller.handleObject,
-	})
+
+	/*
+		// Set up an event handler for when Deployment resources change. This
+		// handler will lookup the owner of the given Deployment, and if it is
+		// owned by a Foo resource will enqueue that Foo resource for
+		// processing. This way, we don't need to implement custom logic for
+		// handling Deployment resources. More info on this pattern:
+		// https://github.com/kubernetes/community/blob/8cafef897a22026d42f5e5bb3f104febe7e29830/contributors/devel/controllers.md
+		deploymentInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc: controller.handleObject,
+			UpdateFunc: func(old, new interface{}) {
+				newDepl := new.(*appsv1.Deployment)
+				oldDepl := old.(*appsv1.Deployment)
+				if newDepl.ResourceVersion == oldDepl.ResourceVersion {
+					// Periodic resync will send update events for all known Deployments.
+					// Two different versions of the same Deployment will always have different RVs.
+					return
+				}
+				controller.handleObject(new)
+			},
+			DeleteFunc: controller.handleObject,
+		})
+	*/
 
 	return controller
 }
@@ -153,11 +180,11 @@ func (c *Controller) Run(threadiness int, stopCh <-chan struct{}) error {
 	defer c.workqueue.ShutDown()
 
 	// Start the informer factories to begin populating the informer caches
-	klog.Info("Starting Foo controller")
+	klog.Info("Starting Loadbalancer controller")
 
 	// Wait for the caches to be synced before starting workers
 	klog.Info("Waiting for informer caches to sync")
-	if ok := cache.WaitForCacheSync(stopCh, c.deploymentsSynced, c.foosSynced); !ok {
+	if ok := cache.WaitForCacheSync(stopCh, c.loadbalancersSynced); !ok {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
 
@@ -238,7 +265,7 @@ func (c *Controller) processNextWorkItem() bool {
 }
 
 // syncHandler compares the actual state with the desired, and attempts to
-// converge the two. It then updates the Status block of the Foo resource
+// converge the two. It then updates the Status block of the Loadbalancer resource
 // with the current status of the resource.
 func (c *Controller) syncHandler(key string) error {
 	// Convert the namespace/name string into a distinct namespace and name
@@ -249,75 +276,198 @@ func (c *Controller) syncHandler(key string) error {
 	}
 
 	// Get the Foo resource with this namespace/name
-	foo, err := c.foosLister.Foos(namespace).Get(name)
+	/*
+		foo, err := c.foosLister.Foos(namespace).Get(name)
+		if err != nil {
+			// The Foo resource may no longer exist, in which case we stop
+			// processing.
+			if errors.IsNotFound(err) {
+				utilruntime.HandleError(fmt.Errorf("foo '%s' in work queue no longer exists", key))
+				return nil
+			}
+
+			return err
+		}
+	*/
+
+	// Get the Loadbalancer resource with this namespace/name
+	loadbalancer, err := c.loadbalancersLister.Loadbalancers(namespace).Get(name)
 	if err != nil {
-		// The Foo resource may no longer exist, in which case we stop
+		// The Loadbalancer resource may no longer exist, in which case we stop
 		// processing.
 		if errors.IsNotFound(err) {
-			utilruntime.HandleError(fmt.Errorf("foo '%s' in work queue no longer exists", key))
+			utilruntime.HandleError(fmt.Errorf("loadbalancer '%s' in work queue no longer exists", key))
 			return nil
 		}
-
 		return err
 	}
 
-	deploymentName := foo.Spec.DeploymentName
-	if deploymentName == "" {
+	/*
+		deploymentName := foo.Spec.DeploymentName
+		if deploymentName == "" {
+			// We choose to absorb the error here as the worker would requeue the
+			// resource otherwise. Instead, the next time the resource is updated
+			// the resource will be queued again.
+			utilruntime.HandleError(fmt.Errorf("%s: deployment name must be specified", key))
+			return nil
+		}
+	*/
+
+	loadbalancerName := loadbalancer.Spec.LoadbalancerName
+	if loadbalancerName == "" {
 		// We choose to absorb the error here as the worker would requeue the
 		// resource otherwise. Instead, the next time the resource is updated
 		// the resource will be queued again.
-		utilruntime.HandleError(fmt.Errorf("%s: deployment name must be specified", key))
+		utilruntime.HandleError(fmt.Errorf("%s: loadbalancer name must be specified", key))
 		return nil
 	}
 
-	// Get the deployment with the name specified in Foo.spec
-	deployment, err := c.deploymentsLister.Deployments(foo.Namespace).Get(deploymentName)
-	// If the resource doesn't exist, we'll create it
-	if errors.IsNotFound(err) {
-		deployment, err = c.kubeclientset.AppsV1().Deployments(foo.Namespace).Create(context.TODO(), newDeployment(foo), metav1.CreateOptions{})
-	}
+	/*
+		// Get the deployment with the name specified in Foo.spec
+		deployment, err := c.deploymentsLister.Deployments(foo.Namespace).Get(deploymentName)
+		// If the resource doesn't exist, we'll create it
+		if errors.IsNotFound(err) {
+			deployment, err = c.kubeclientset.AppsV1().Deployments(foo.Namespace).Create(context.TODO(), newDeployment(foo), metav1.CreateOptions{})
+		}
 
-	// If an error occurs during Get/Create, we'll requeue the item so we can
-	// attempt processing again later. This could have been caused by a
-	// temporary network failure, or any other transient reason.
-	if err != nil {
+		// If an error occurs during Get/Create, we'll requeue the item so we can
+		// attempt processing again later. This could have been caused by a
+		// temporary network failure, or any other transient reason.
+		if err != nil {
+			return err
+		}
+	*/
+
+	//myurl := "http://localhost:8080/loadbalancers"
+	myurl := "http://" + os.Getenv("MOCK_SERVER_SERVICE_SERVICE_HOST") + "/loadbalancers"
+	//klog.Info("first:myurl " + myurl)
+	var mylb mockLB
+	myFinalizerName := "loadbalancer.finalizers.samplecontroller.k8s.io"
+	myFinalizer := []string{}
+
+	// When delete loadbalancer if DeletionTimestamp is not zero, that means it is delete event.
+	if !loadbalancer.DeletionTimestamp.IsZero() {
+		req, err := http.NewRequest("DELETE", myurl+"/"+loadbalancer.Status.LoadbalancerID, nil)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+
+		client := &http.Client{}
+		res, err := client.Do(req)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		defer res.Body.Close()
+
+		body, err := ioutil.ReadAll(res.Body)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		//json.Unmarshal([]byte(body), &mylb)
+
+		//loadbalancer.Status.LoadbalancerID = mylb.ID
+		//loadbalancer.Status.Status = mylb.Status
+		//loadbalancer.SetFinalizers(myFinalizerName)
+
+		//Delete corresponding finalizer
+		var strSlice = loadbalancer.GetFinalizers()
+		fmt.Printf("Before deleteing : %v\n", strSlice)
+
+		for i, fstr := range strSlice {
+			if fstr == myFinalizerName {
+				loadbalancer.SetFinalizers(append(strSlice[:i], strSlice[i+1:]...))
+			}
+		}
+
+		fmt.Printf("After deleteing : %v\n", loadbalancer.GetFinalizers())
+		fmt.Printf("Loadbalancer is deleted!! =========== %s\n", string(body))
+		_, err = c.sampleclientset.SamplecontrollerV1alpha1().Loadbalancers(loadbalancer.Namespace).Update(context.TODO(), loadbalancer, metav1.UpdateOptions{})
 		return err
 	}
 
-	// If the Deployment is not controlled by this Foo resource, we should log
-	// a warning to the event recorder and return error msg.
-	if !metav1.IsControlledBy(deployment, foo) {
-		msg := fmt.Sprintf(MessageResourceExists, deployment.Name)
-		c.recorder.Event(foo, corev1.EventTypeWarning, ErrResourceExists, msg)
-		return fmt.Errorf(msg)
+	// If loadbalancer.Status.LoadbalancerID is empty, create loadbalancer.
+	// Send request creating loadbalancer mok api, get loadbalancer id in response
+	if loadbalancer.Status.LoadbalancerID == "" {
+		values := map[string]string{"Name": loadbalancer.Spec.LoadbalancerName}
+		jsonValue, _ := json.Marshal(values)
+
+		//klog.Info("create Loadbalancer:myurl " + myurl)
+		req, err := http.NewRequest("POST", myurl, bytes.NewBuffer(jsonValue))
+		if err != nil {
+			log.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		client := &http.Client{}
+		res, err := client.Do(req)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		defer res.Body.Close()
+
+		body, err := ioutil.ReadAll(res.Body)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		json.Unmarshal([]byte(body), &mylb)
+
+		loadbalancer.Status.LoadbalancerID = mylb.ID
+		loadbalancer.Status.Status = mylb.Status
+		loadbalancer.SetFinalizers(append(myFinalizer, myFinalizerName))
+		fmt.Println("New loadbalancer created!!")
+		fmt.Println(mylb)
 	}
 
-	// If this number of the replicas on the Foo resource is specified, and the
-	// number does not equal the current desired replicas on the Deployment, we
-	// should update the Deployment resource.
-	if foo.Spec.Replicas != nil && *foo.Spec.Replicas != *deployment.Spec.Replicas {
-		klog.V(4).Infof("Foo %s replicas: %d, deployment replicas: %d", name, *foo.Spec.Replicas, *deployment.Spec.Replicas)
-		deployment, err = c.kubeclientset.AppsV1().Deployments(foo.Namespace).Update(context.TODO(), newDeployment(foo), metav1.UpdateOptions{})
-	}
+	/*
+		// If the Deployment is not controlled by this Foo resource, we should log
+		// a warning to the event recorder and return error msg.
+		if !metav1.IsControlledBy(deployment, foo) {
+			msg := fmt.Sprintf(MessageResourceExists, deployment.Name)
+			c.recorder.Event(foo, corev1.EventTypeWarning, ErrResourceExists, msg)
+			return fmt.Errorf(msg)
+		}
 
-	// If an error occurs during Update, we'll requeue the item so we can
-	// attempt processing again later. This could have been caused by a
-	// temporary network failure, or any other transient reason.
-	if err != nil {
-		return err
-	}
+		// If this number of the replicas on the Foo resource is specified, and the
+		// number does not equal the current desired replicas on the Deployment, we
+		// should update the Deployment resource.
+		if foo.Spec.Replicas != nil && *foo.Spec.Replicas != *deployment.Spec.Replicas {
+			klog.V(4).Infof("Foo %s replicas: %d, deployment replicas: %d", name, *foo.Spec.Replicas, *deployment.Spec.Replicas)
+			deployment, err = c.kubeclientset.AppsV1().Deployments(foo.Namespace).Update(context.TODO(), newDeployment(foo), metav1.UpdateOptions{})
+		}
+
+		// If an error occurs during Update, we'll requeue the item so we can
+		// attempt processing again later. This could have been caused by a
+		// temporary network failure, or any other transient reason.
+		if err != nil {
+			return err
+		}
+	*/
 
 	// Finally, we update the status block of the Foo resource to reflect the
 	// current state of the world
-	err = c.updateFooStatus(foo, deployment)
+	/*
+		err = c.updateFooStatus(foo, deployment)
+		if err != nil {
+			return err
+		}
+	*/
+
+	err = c.updateLoadbalancerStatus(loadbalancer)
 	if err != nil {
 		return err
 	}
 
-	c.recorder.Event(foo, corev1.EventTypeNormal, SuccessSynced, MessageResourceSynced)
+	c.recorder.Event(loadbalancer, corev1.EventTypeNormal, SuccessSynced, MessageResourceSynced)
 	return nil
 }
 
+/*
 func (c *Controller) updateFooStatus(foo *samplev1alpha1.Foo, deployment *appsv1.Deployment) error {
 	// NEVER modify objects from the store. It's a read-only, local cache.
 	// You can use DeepCopy() to make a deep copy of original object and modify this copy
@@ -331,11 +481,73 @@ func (c *Controller) updateFooStatus(foo *samplev1alpha1.Foo, deployment *appsv1
 	_, err := c.sampleclientset.SamplecontrollerV1alpha1().Foos(foo.Namespace).Update(context.TODO(), fooCopy, metav1.UpdateOptions{})
 	return err
 }
+*/
 
+func (c *Controller) updateLoadbalancerStatus(loadbalancer *samplev1alpha1.Loadbalancer) error {
+
+	// NEVER modify objects from the store. It's a read-only, local cache.
+	// You can use DeepCopy() to make a deep copy of original object and modify this copy
+	// Or create a copy manually for better performance
+	loadbalancerCopy := loadbalancer.DeepCopy()
+
+	myurl := "http://" + os.Getenv("MOCK_SERVER_SERVICE_SERVICE_HOST") + "/loadbalancers/"
+	//klog.Info("updateLoadbalancerStatus:myurl " + myurl)
+
+	req, err := http.NewRequest("GET", myurl+loadbalancerCopy.Status.LoadbalancerID, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	res, err := client.Do(req)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	defer res.Body.Close()
+
+	body, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var mylb mockLB
+
+	json.Unmarshal([]byte(body), &mylb)
+
+	if mylb.Name != loadbalancerCopy.Spec.LoadbalancerName || mylb.Status != loadbalancerCopy.Status.Status {
+		fmt.Println("Name or Status is changed, Need update")
+		loadbalancerCopy.Spec.LoadbalancerName = mylb.Name
+		loadbalancerCopy.Status.Status = mylb.Status
+	}
+
+	// loadbalancerCopy.Status.AvailableReplicas = deployment.Status.AvailableReplicas
+	// If the CustomResourceSubresources feature gate is not enabled,
+	// we must use Update instead of UpdateStatus to update the Status block of the Loadbalancer resource.
+	// UpdateStatus will not allow changes to the Spec of the resource,
+	// which is ideal for ensuring nothing other than resource status has been updated.
+	_, err = c.sampleclientset.SamplecontrollerV1alpha1().Loadbalancers(loadbalancer.Namespace).Update(context.TODO(), loadbalancerCopy, metav1.UpdateOptions{})
+	return err
+}
+
+/*
 // enqueueFoo takes a Foo resource and converts it into a namespace/name
 // string which is then put onto the work queue. This method should *not* be
 // passed resources of any type other than Foo.
 func (c *Controller) enqueueFoo(obj interface{}) {
+	var key string
+	var err error
+	if key, err = cache.MetaNamespaceKeyFunc(obj); err != nil {
+		utilruntime.HandleError(err)
+		return
+	}
+	c.workqueue.Add(key)
+}
+*/
+
+func (c *Controller) enqueueLoadbalancer(obj interface{}) {
 	var key string
 	var err error
 	if key, err = cache.MetaNamespaceKeyFunc(obj); err != nil {
@@ -350,6 +562,7 @@ func (c *Controller) enqueueFoo(obj interface{}) {
 // objects metadata.ownerReferences field for an appropriate OwnerReference.
 // It then enqueues that Foo resource to be processed. If the object does not
 // have an appropriate OwnerReference, it will simply be skipped.
+/*
 func (c *Controller) handleObject(obj interface{}) {
 	var object metav1.Object
 	var ok bool
@@ -384,7 +597,44 @@ func (c *Controller) handleObject(obj interface{}) {
 		return
 	}
 }
+*/
 
+func (c *Controller) handleObject(obj interface{}) {
+	var object metav1.Object
+	var ok bool
+	if object, ok = obj.(metav1.Object); !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			utilruntime.HandleError(fmt.Errorf("error decoding object, invalid type"))
+			return
+		}
+		object, ok = tombstone.Obj.(metav1.Object)
+		if !ok {
+			utilruntime.HandleError(fmt.Errorf("error decoding object tombstone, invalid type"))
+			return
+		}
+		klog.V(4).Infof("Recovered deleted object '%s' from tombstone", object.GetName())
+	}
+	klog.V(4).Infof("Processing object: %s", object.GetName())
+	if ownerRef := metav1.GetControllerOf(object); ownerRef != nil {
+		// If this object is not owned by a Foo, we should not do anything more
+		// with it.
+		if ownerRef.Kind != "Foo" {
+			return
+		}
+
+		loadbalancer, err := c.loadbalancersLister.Loadbalancers(object.GetNamespace()).Get(ownerRef.Name)
+		if err != nil {
+			klog.V(4).Infof("ignoring orphaned object '%s' of foo '%s'", object.GetSelfLink(), ownerRef.Name)
+			return
+		}
+
+		c.enqueueLoadbalancer(loadbalancer)
+		return
+	}
+}
+
+/*
 // newDeployment creates a new Deployment for a Foo resource. It also sets
 // the appropriate OwnerReferences on the resource so handleObject can discover
 // the Foo resource that 'owns' it.
@@ -422,3 +672,4 @@ func newDeployment(foo *samplev1alpha1.Foo) *appsv1.Deployment {
 		},
 	}
 }
+*/

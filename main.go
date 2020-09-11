@@ -17,29 +17,182 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"flag"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kubeinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	clientset_kube "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/leaderelection"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/klog/v2"
+
 	// Uncomment the following line to load the gcp plugin (only required to authenticate against GKE clusters).
 	// _ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 
-	clientset "k8s.io/sample-controller/pkg/generated/clientset/versioned"
-	informers "k8s.io/sample-controller/pkg/generated/informers/externalversions"
-	"k8s.io/sample-controller/pkg/signals"
+	"github.com/google/uuid"
+	clientset "github.com/sample-controller/pkg/generated/clientset/versioned"
+	informers "github.com/sample-controller/pkg/generated/informers/externalversions"
+	"github.com/sample-controller/pkg/signals"
 )
 
 var (
-	masterURL  string
-	kubeconfig string
+	masterURL          string
+	kubeconfig         string
+	leaseLockName      string
+	leaseLockNamespace string
+	id                 string
 )
+
+func buildConfig(kubeconfig string) (*rest.Config, error) {
+	if kubeconfig != "" {
+		cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+		if err != nil {
+			return nil, err
+		}
+		return cfg, nil
+	}
+
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
 
 func main() {
 	klog.InitFlags(nil)
 	flag.Parse()
+
+	if leaseLockName == "" {
+		klog.Fatal("unable to get lease lock resource name (missing lease-lock-name flag).")
+	}
+	if leaseLockNamespace == "" {
+		klog.Fatal("unable to get lease lock resource namespace (missing lease-lock-namespace flag).")
+	}
+
+	// leader election uses the Kubernetes API by writing to a
+	// lock object, which can be a LeaseLock object (preferred),
+	// a ConfigMap, or an Endpoints (deprecated) object.
+	// Conflicting writes are detected and each client handles those actions
+	// independently.
+	config, err := buildConfig(kubeconfig)
+	if err != nil {
+		klog.Fatal(err)
+	}
+	client := clientset_kube.NewForConfigOrDie(config)
+
+	run := func(ctx context.Context) {
+		// complete your controller loop here
+		klog.Info("Controller loop...")
+
+		// set up signals so we handle the first shutdown signal gracefully
+		stopCh := signals.SetupSignalHandler()
+
+		cfg, err := clientcmd.BuildConfigFromFlags(masterURL, kubeconfig)
+		if err != nil {
+			klog.Fatalf("Error building kubeconfig: %s", err.Error())
+		}
+
+		kubeClient, err := kubernetes.NewForConfig(cfg)
+		if err != nil {
+			klog.Fatalf("Error building kubernetes clientset: %s", err.Error())
+		}
+
+		exampleClient, err := clientset.NewForConfig(cfg)
+		if err != nil {
+			klog.Fatalf("Error building example clientset: %s", err.Error())
+		}
+
+		kubeInformerFactory := kubeinformers.NewSharedInformerFactory(kubeClient, time.Second*30)
+		exampleInformerFactory := informers.NewSharedInformerFactory(exampleClient, time.Second*30)
+
+		controller := NewController(kubeClient, exampleClient,
+			//kubeInformerFactory.Apps().V1().Deployments(),
+			exampleInformerFactory.Samplecontroller().V1alpha1().Loadbalancers())
+
+		// notice that there is no need to run Start methods in a separate goroutine. (i.e. go kubeInformerFactory.Start(stopCh)
+		// Start method is non-blocking and runs all registered informers in a dedicated goroutine.
+		kubeInformerFactory.Start(stopCh)
+		exampleInformerFactory.Start(stopCh)
+
+		if err = controller.Run(2, stopCh); err != nil {
+			klog.Fatalf("Error running controller: %s", err.Error())
+		}
+
+		select {}
+	}
+
+	// use a Go context so we can tell the leaderelection code when we
+	// want to step down
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// listen for interrupts or the Linux SIGTERM signal and cancel
+	// our context, which the leader election code will observe and
+	// step down
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-ch
+		klog.Info("Received termination, signaling shutdown")
+		cancel()
+	}()
+
+	// we use the Lease lock type since edits to Leases are less common
+	// and fewer objects in the cluster watch "all Leases".
+	lock := &resourcelock.LeaseLock{
+		LeaseMeta: metav1.ObjectMeta{
+			Name:      leaseLockName,
+			Namespace: leaseLockNamespace,
+		},
+		Client: client.CoordinationV1(),
+		LockConfig: resourcelock.ResourceLockConfig{
+			Identity: id,
+		},
+	}
+
+	// start the leader election code loop
+	leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
+		Lock: lock,
+		// IMPORTANT: you MUST ensure that any code you have that
+		// is protected by the lease must terminate **before**
+		// you call cancel. Otherwise, you could have a background
+		// loop still running and another process could
+		// get elected before your background loop finished, violating
+		// the stated goal of the lease.
+		ReleaseOnCancel: true,
+		LeaseDuration:   60 * time.Second,
+		RenewDeadline:   15 * time.Second,
+		RetryPeriod:     5 * time.Second,
+		Callbacks: leaderelection.LeaderCallbacks{
+			OnStartedLeading: func(ctx context.Context) {
+				// we're notified when we start - this is where you would
+				// usually put your code
+				run(ctx)
+			},
+			OnStoppedLeading: func() {
+				// we can do cleanup here
+				klog.Infof("leader lost: %s", id)
+				os.Exit(0)
+			},
+			OnNewLeader: func(identity string) {
+				// we're notified when new leader elected
+				if identity == id {
+					// I just got the lock
+					return
+				}
+				klog.Infof("new leader elected: %s", identity)
+			},
+		},
+	})
 
 	// set up signals so we handle the first shutdown signal gracefully
 	stopCh := signals.SetupSignalHandler()
@@ -63,8 +216,8 @@ func main() {
 	exampleInformerFactory := informers.NewSharedInformerFactory(exampleClient, time.Second*30)
 
 	controller := NewController(kubeClient, exampleClient,
-		kubeInformerFactory.Apps().V1().Deployments(),
-		exampleInformerFactory.Samplecontroller().V1alpha1().Foos())
+		//kubeInformerFactory.Apps().V1().Deployments(),
+		exampleInformerFactory.Samplecontroller().V1alpha1().Loadbalancers())
 
 	// notice that there is no need to run Start methods in a separate goroutine. (i.e. go kubeInformerFactory.Start(stopCh)
 	// Start method is non-blocking and runs all registered informers in a dedicated goroutine.
@@ -79,4 +232,7 @@ func main() {
 func init() {
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster.")
 	flag.StringVar(&masterURL, "master", "", "The address of the Kubernetes API server. Overrides any value in kubeconfig. Only required if out-of-cluster.")
+	flag.StringVar(&id, "id", uuid.New().String(), "the holder identity name")
+	flag.StringVar(&leaseLockName, "lease-lock-name", "", "the lease lock resource name")
+	flag.StringVar(&leaseLockNamespace, "lease-lock-namespace", "", "the lease lock resource namespace")
 }
