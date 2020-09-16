@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"time"
@@ -40,14 +41,18 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	ctrlmetrics "github.com/sample-controller/metrics"
 	samplev1alpha1 "github.com/sample-controller/pkg/apis/samplecontroller/v1alpha1"
 	clientset "github.com/sample-controller/pkg/generated/clientset/versioned"
 	samplescheme "github.com/sample-controller/pkg/generated/clientset/versioned/scheme"
 	informers "github.com/sample-controller/pkg/generated/informers/externalversions/samplecontroller/v1alpha1"
 	listers "github.com/sample-controller/pkg/generated/listers/samplecontroller/v1alpha1"
+	"github.com/sample-controller/pkg/metrics"
 )
 
 const controllerAgentName = "sample-controller"
+const defaultMetricsEndpoint = "/metrics"
 
 const (
 	// SuccessSynced is used as part of the Event 'reason' when a Foo is synced
@@ -83,6 +88,8 @@ type Controller struct {
 	// recorder is an event recorder for recording Event resources to the
 	// Kubernetes API.
 	recorder record.EventRecorder
+	// metricsListener is used to serve prometheus metrics
+	metricsListener net.Listener
 }
 
 type mockLB struct {
@@ -113,6 +120,7 @@ func NewController(
 	eventBroadcaster.StartStructuredLogging(0)
 	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: kubeclientset.CoreV1().Events("")})
 	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: controllerAgentName})
+	metricsListener, _ := metrics.NewListener("")
 
 	controller := &Controller{
 		kubeclientset:   kubeclientset,
@@ -125,6 +133,7 @@ func NewController(
 		loadbalancersSynced: loadbalancerInformer.Informer().HasSynced,
 		workqueue:           workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Loadbalancers"),
 		recorder:            recorder,
+		metricsListener:     metricsListener,
 	}
 
 	klog.Info("Setting up event handlers")
@@ -188,7 +197,31 @@ func (c *Controller) Run(threadiness int, stopCh <-chan struct{}) error {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
 
-	klog.Info("Starting workers")
+	klog.Info("Starting workers ", "worker count ", threadiness)
+
+	klog.Info("metrics.Registry : ", metrics.Registry)
+
+	//serveMetrics
+	handler := promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{
+		ErrorHandling: promhttp.HTTPErrorOnError,
+	})
+	// TODO(JoelSpeed): Use existing Kubernetes machinery for serving metrics
+	mux := http.NewServeMux()
+	mux.Handle(defaultMetricsEndpoint, handler)
+
+	server := http.Server{
+		Handler: mux,
+	}
+
+	klog.Info("Starting metrics server! ", "path : ", defaultMetricsEndpoint)
+
+	go func() {
+		if err := server.Serve(c.metricsListener); err != nil && err != http.ErrServerClosed {
+			<-stopCh
+		}
+	}()
+
+	ctrlmetrics.WorkerCount.WithLabelValues(controllerAgentName).Set(float64(threadiness))
 	// Launch two workers to process Foo resources
 	for i := 0; i < threadiness; i++ {
 		go wait.Until(c.runWorker, time.Second, stopCh)
@@ -212,6 +245,11 @@ func (c *Controller) runWorker() {
 // processNextWorkItem will read a single work item off the workqueue and
 // attempt to process it, by calling the syncHandler.
 func (c *Controller) processNextWorkItem() bool {
+
+	// Update metrics after processing each item
+	reconcileStartTS := time.Now()
+	defer c.updateMetrics(time.Now().Sub(reconcileStartTS))
+
 	obj, shutdown := c.workqueue.Get()
 
 	if shutdown {
@@ -227,6 +265,16 @@ func (c *Controller) processNextWorkItem() bool {
 		// put back on the workqueue and attempted again after a back-off
 		// period.
 		defer c.workqueue.Done(obj)
+
+		ctrlmetrics.ActiveWorkers.WithLabelValues(controllerAgentName).Add(1)
+		defer ctrlmetrics.ActiveWorkers.WithLabelValues(controllerAgentName).Add(-1)
+
+		// Update metrics after processing each item
+		reconcileStartTS := time.Now()
+		defer func() {
+			c.updateMetrics(time.Since(reconcileStartTS))
+		}()
+
 		var key string
 		var ok bool
 		// We expect strings to come off the workqueue. These are of the
@@ -247,6 +295,8 @@ func (c *Controller) processNextWorkItem() bool {
 		if err := c.syncHandler(key); err != nil {
 			// Put the item back on the workqueue to handle any transient errors.
 			c.workqueue.AddRateLimited(key)
+			ctrlmetrics.ReconcileErrors.WithLabelValues(controllerAgentName).Inc()
+			ctrlmetrics.ReconcileTotal.WithLabelValues(controllerAgentName, "error").Inc()
 			return fmt.Errorf("error syncing '%s': %s, requeuing", key, err.Error())
 		}
 		// Finally, if no error occurs we Forget this item so it does not
@@ -261,6 +311,7 @@ func (c *Controller) processNextWorkItem() bool {
 		return true
 	}
 
+	ctrlmetrics.ReconcileTotal.WithLabelValues(controllerAgentName, "success").Inc()
 	return true
 }
 
@@ -673,3 +724,10 @@ func newDeployment(foo *samplev1alpha1.Foo) *appsv1.Deployment {
 	}
 }
 */
+
+// updateMetrics updates prometheus metrics within the controller
+func (c *Controller) updateMetrics(reconcileTime time.Duration) {
+	//ctrlmetrics.QueueLength.WithLabelValues(c.Name).Set(float64(c.Queue.Len()))
+	//ctrlmetrics.QueueLength.WithLabelValues(controllerAgentName).Set(float64(c.workqueue.Len()))
+	ctrlmetrics.ReconcileTime.WithLabelValues(controllerAgentName).Observe(reconcileTime.Seconds())
+}

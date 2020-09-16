@@ -5,13 +5,19 @@ module github.com/sample-controller
 go 1.15
 
 require (
+	github.com/go-logr/logr v0.2.1
 	github.com/google/uuid v1.1.1
+	github.com/onsi/ginkgo v1.12.1
+	github.com/onsi/gomega v1.10.1
+	github.com/prometheus/client_golang v1.7.1
 	k8s.io/api v0.18.6
 	k8s.io/apimachinery v0.18.6
 	k8s.io/client-go v0.18.6
 	k8s.io/code-generator v0.18.6
+	k8s.io/klog v1.0.0
 	k8s.io/klog/v2 v2.2.0
 	k8s.io/sample-controller v0.18.6
+	sigs.k8s.io/controller-runtime v0.6.2
 )
 
 replace (
